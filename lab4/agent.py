@@ -106,6 +106,12 @@ class RobotAgent:
             cell_size=cfg.cell_size,
             safety_radius=nav_safety,
             slowdown_radius=nav_slowdown,
+            # Collision avoidance: VERY CONSERVATIVE settings
+            robot_min_distance=1.0,
+            human_min_distance=1.0,
+            obstacle_stop_distance=2.0,           # Stop if obstacle < 2.0m (2m buffer)
+            obstacle_slowdown_distance=3.0,       # Start slowing at 3.0m (3m buffer)
+            obstacle_front_angle=1.57,            # ~90° forward cone for detection
         ))
 
         # ── Job Manager ──

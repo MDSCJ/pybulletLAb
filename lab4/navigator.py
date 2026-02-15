@@ -27,7 +27,13 @@ class NavConfig:
     w_max: float = 3.0
     k_heading: float = 3.5
     goal_tol_m: float = 0.6
-    # Dynamic obstacle avoidance
+    # Dynamic obstacle avoidance — collision avoidance for robots & humans
+    robot_min_distance: float = 1.0    # Maintain 1.0m distance from other robots
+    human_min_distance: float = 1.0    # Maintain 1.0m distance from humans
+    obstacle_stop_distance: float = 2.0    # Stop if obstacle closer than this (CONSERVATIVE)
+    obstacle_slowdown_distance: float = 3.0  # Start slowing at 3.0m - wide buffer
+    obstacle_front_angle: float = 6.28  # 360° - detect obstacles from ALL directions
+    # Legacy parameters (kept for backward compatibility)
     safety_radius: float = 0.35
     slowdown_radius: float = 0.70
     # Wall avoidance thresholds (will be scaled to cell_size in Navigator.__init__)
@@ -67,8 +73,42 @@ class Navigator:
         self._path_idx = 0
 
     def set_dynamic_obstacles(self, positions: List[Tuple[float, float]]):
-        """Update list of dynamic obstacle positions (e.g., humans)."""
+        """Update list of dynamic obstacle positions (e.g., humans, other robots)."""
         self._dyn_obstacles = list(positions)
+
+    def _get_front_obstacle_dist(self, x: float, y: float, th: float) -> Tuple[float, float]:
+        """
+        Find the closest obstacle around the robot.
+        Returns: (distance_to_closest, average_distance_all_obstacles)
+        
+        This detects obstacles in all directions (360°).
+        """
+        if not self._dyn_obstacles:
+            return float("inf"), float("inf")
+
+        obstacle_dists = []
+        
+        for ox, oy in self._dyn_obstacles:
+            # Vector from robot to obstacle
+            dx = ox - x
+            dy = oy - y
+            obs_dist = math.hypot(dx, dy)
+            obstacle_dists.append(obs_dist)
+        
+        if not obstacle_dists:
+            return float("inf"), float("inf")
+        
+        closest = min(obstacle_dists)
+        avg_dist = sum(obstacle_dists) / len(obstacle_dists)
+        return closest, avg_dist
+    
+    def _should_stop_for_obstacle(self, x: float, y: float, th: float) -> bool:
+        """
+        Check if there's an obstacle directly ahead that requires stopping.
+        Returns True if an obstacle is closer than obstacle_stop_distance in front.
+        """
+        front_dist, _ = self._get_front_obstacle_dist(x, y, th)
+        return front_dist < self.cfg.obstacle_stop_distance
 
     def plan_from_pose(self, x: float, y: float) -> bool:
         """Plan a path from world position (x, y) to goal cell using A*.
@@ -146,15 +186,33 @@ class Navigator:
         if dist_to_goal <= self.cfg.goal_tol_m:
             return 0.0, 0.0, True
 
-        # Dynamic obstacle check
-        obs_dist = self._nearest_obstacle_dist(x, y)
-        if obs_dist < self.cfg.safety_radius:
-            return 0.0, 0.0, False   # full stop
+        # ── COLLISION AVOIDANCE: Check for obstacles in front ──
+        # Stop immediately if obstacle is too close ahead
+        if self._should_stop_for_obstacle(x, y, th):
+            # Obstacle directly ahead — full stop
+            return 0.0, 0.0, False
+        
+        # Get distance to closest obstacle (from any direction)
+        front_obstacle_dist, _ = self._get_front_obstacle_dist(x, y, th)
         obs_factor = 1.0
-        if obs_dist < self.cfg.slowdown_radius:
-            obs_factor = max(0.2, (obs_dist - self.cfg.safety_radius)
-                             / (self.cfg.slowdown_radius - self.cfg.safety_radius))
-            # print(f"[NAV] Dynamic Obstacle Avoidance: dist={obs_dist:.2f}m factor={obs_factor:.2f}")
+        
+        # Apply aggressive slowdown if ANY obstacle is nearby
+        # Use a much wider safety margin
+        conservative_slowdown_distance = self.cfg.obstacle_slowdown_distance + 1.0  # Extra 1m buffer
+        
+        if front_obstacle_dist < conservative_slowdown_distance and front_obstacle_dist < float("inf"):
+            # Slow down VERY proportionally as we approach the obstacle
+            if front_obstacle_dist < self.cfg.obstacle_stop_distance:
+                # Extremely close — nearly stopped already
+                obs_factor = 0.05
+            else:
+                # Gradual slowdown over a wider range
+                slow_down_range = self.cfg.obstacle_slowdown_distance - self.cfg.obstacle_stop_distance
+                if slow_down_range > 0:
+                    obs_factor = max(0.05, (front_obstacle_dist - self.cfg.obstacle_stop_distance) / slow_down_range)
+                else:
+                    obs_factor = 0.05
+            # print(f"[NAV] Obstacle at {front_obstacle_dist:.2f}m -> speed factor: {obs_factor:.2f}")
 
         # Near end of path: aim directly at goal
         if dist_to_goal < 1.2:
