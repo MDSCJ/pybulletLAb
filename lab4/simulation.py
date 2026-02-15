@@ -236,14 +236,17 @@ class Simulation:
                 all_done = False
                 
                 # Construct obstacles list for this agent
-                # Humans + other robots
+                # Humans + other robots with their types
                 obstacles = list(human_positions)
+                obstacle_types = ['human'] * len(human_positions)
+                
                 for j, (ax, ay) in enumerate(agent_poses):
                     if i != j:
                         obstacles.append((ax, ay))
+                        obstacle_types.append(f'robot_{j}')
                 
-                # Update agent
-                metrics = agent.update(self.dt, sim_t, obstacles)
+                # Update agent with priority-based obstacle avoidance
+                metrics = agent.update(self.dt, sim_t, obstacles, obstacle_types)
                 
                 if "pf_err" in metrics:
                     total_pf_errors.append(metrics["pf_err"])

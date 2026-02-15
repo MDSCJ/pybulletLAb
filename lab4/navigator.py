@@ -46,13 +46,16 @@ class Navigator:
     """
     Pipeline: estimated pose (PF) -> cell -> A* -> world path -> follow (v, w).
     Supports dynamic obstacle (human) avoidance via set_dynamic_obstacles().
+    Priority system: higher-numbered robots ignore lower-numbered robots.
     """
 
-    def __init__(self, grid, cfg: NavConfig):
+    def __init__(self, grid, cfg: NavConfig, robot_id: int = 0, total_robots: int = 1):
         self.grid = grid
         self.cfg = cfg
         self.rows = len(grid)
         self.cols = len(grid[0])
+        self.robot_id = robot_id
+        self.total_robots = total_robots
 
         # Inflated grid for A* planning (robot clearance)
         self._inflated = inflate_grid(grid, radius=1)
@@ -63,7 +66,9 @@ class Navigator:
         self._path_idx = 0
 
         # Dynamic obstacles (positions updated each tick)
+        # Each obstacle is (x, y, type) where type is 'robot_<id>' or 'human'
         self._dyn_obstacles: List[Tuple[float, float]] = []
+        self._dyn_obstacle_types: List[str] = []
 
     def set_goal_cell(self, r: int, c: int):
         """Set goal cell and reset path."""
@@ -72,23 +77,45 @@ class Navigator:
         self.path_world = []
         self._path_idx = 0
 
-    def set_dynamic_obstacles(self, positions: List[Tuple[float, float]]):
-        """Update list of dynamic obstacle positions (e.g., humans, other robots)."""
+    def set_dynamic_obstacles(self, positions: List[Tuple[float, float]], obstacle_types: Optional[List[str]] = None):
+        """
+        Update list of dynamic obstacle positions (e.g., humans, other robots).
+        obstacle_types: list of strings like 'human' or 'robot_<id>'.
+        Priority: higher robot IDs ignore lower robot IDs; all robots avoid humans.
+        """
         self._dyn_obstacles = list(positions)
+        if obstacle_types is None:
+            self._dyn_obstacle_types = ['human'] * len(positions)
+        else:
+            self._dyn_obstacle_types = list(obstacle_types)
 
     def _get_front_obstacle_dist(self, x: float, y: float, th: float) -> Tuple[float, float]:
         """
-        Find the closest obstacle around the robot.
+        Find the closest obstacle around the robot based on priority.
         Returns: (distance_to_closest, average_distance_all_obstacles)
         
         This detects obstacles in all directions (360°).
+        Priority: only avoid robots with HIGHER IDs; always avoid humans.
+        Hierarchy: Robot 0 stops for 1,2,3... | Robot 1 stops for 2,3,4... | etc.
         """
         if not self._dyn_obstacles:
             return float("inf"), float("inf")
 
         obstacle_dists = []
         
-        for ox, oy in self._dyn_obstacles:
+        for i, (ox, oy) in enumerate(self._dyn_obstacles):
+            obs_type = self._dyn_obstacle_types[i] if i < len(self._dyn_obstacle_types) else 'human'
+            
+            # Check priority: skip robots with lower or equal IDs
+            if obs_type.startswith('robot_'):
+                try:
+                    robot_id = int(obs_type.split('_')[1])
+                    # Only stop for robots with HIGHER ID (strict hierarchy)
+                    if robot_id <= self.robot_id:
+                        continue  # Ignore this robot (it has lower or equal priority)
+                except (ValueError, IndexError):
+                    pass  # If parsing fails, treat as human
+            
             # Vector from robot to obstacle
             dx = ox - x
             dy = oy - y

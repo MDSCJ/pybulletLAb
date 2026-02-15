@@ -112,7 +112,7 @@ class RobotAgent:
             obstacle_stop_distance=2.0,           # Stop if obstacle < 2.0m (2m buffer)
             obstacle_slowdown_distance=3.0,       # Start slowing at 3.0m (3m buffer)
             obstacle_front_angle=1.57,            # ~90° forward cone for detection
-        ))
+        ), robot_id=agent_id, total_robots=cfg.n_robots)
 
         # ── Job Manager ──
         self.job_manager: Optional[JobManager] = None
@@ -225,7 +225,7 @@ class RobotAgent:
         print(f"[Agent {self.id}] Failed to pick reachable random goal.")
 
 
-    def update(self, dt: float, sim_t: float, dynamic_obstacles: List[Tuple[float, float]]) -> Dict:
+    def update(self, dt: float, sim_t: float, dynamic_obstacles: List[Tuple[float, float]], obstacle_types: Optional[List[str]] = None) -> Dict:
         """
         Run one control cycle.
         Returns metrics dict (e.g. pf_error, etc).
@@ -323,7 +323,7 @@ class RobotAgent:
             if self.mapper and self.last_scan is not None:
                 self.mapper.update(x_ctrl, y_ctrl, th_ctrl, self.last_scan, self.angles)
 
-            self.nav.set_dynamic_obstacles(dynamic_obstacles)
+            self.nav.set_dynamic_obstacles(dynamic_obstacles, obstacle_types)
 
             # ── Step 2: Check goal distance ──
             goal_dist = float('inf')
