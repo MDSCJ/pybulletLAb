@@ -32,7 +32,7 @@ source .venv/bin/activate        # Linux/macOS
 pip install numpy pybullet matplotlib
 ```
 
-**Requirements:** Python 3.10+, NumPy, PyBullet, Matplotlib (for analysis).
+**Requirements:** Python 3.10+, NumPy, PyBullet, Matplotlib (optional, for analysis plots).
 
 ---
 
@@ -77,7 +77,7 @@ python -m lab4.main --map warehouse_small --nav --goal_random --slam --direct
 |-----------------|---------|----------------------------------|
 | `--n`           | 500     | Number of particles              |
 | `--scan_period` | 0.4     | Lidar scan period (seconds)      |
-| `--angles_n`    | 16      | Number of lidar rays             |
+| `--angles_n`    | 36      | Number of lidar rays             |
 
 ### Navigation
 | Parameter       | Default | Description                      |
@@ -88,14 +88,6 @@ python -m lab4.main --map warehouse_small --nav --goal_random --slam --direct
 | `--goal_random` | false   | Random goal (loops)              |
 | `--goal_margin` | 1       | Margin from walls for goal       |
 | `--replan_s`    | 2.0     | Replan interval (seconds)        |
-
-### Speeds
-| Parameter       | Default | Description                      |
-|-----------------|---------|----------------------------------|
-| `--v_straight`  | 3.5     | Straight-line velocity (m/s)     |
-| `--w_turn`      | 3.5     | Turning angular velocity (rad/s) |
-| `--v_curve`     | 2.5     | Curve linear velocity (m/s)      |
-| `--w_curve`     | 2.5     | Curve angular velocity (rad/s)   |
 
 ### Emergency Recovery
 | Parameter             | Default | Description                      |
@@ -112,6 +104,15 @@ python -m lab4.main --map warehouse_small --nav --goal_random --slam --direct
 | `--robots`  | 1       | Number of robots (Phase 5)           |
 | `--slam`    | false   | Enable SLAM mapping (Phase 6)        |
 
+### Speeds
+| Parameter       | Default | Description                      |
+|-----------------|---------|----------------------------------|
+| `--v_straight`  | 3.5     | Straight-line velocity (m/s)     |
+| `--w_turn`      | 3.5     | Turning angular velocity (rad/s) |
+| `--v_curve`     | 2.5     | Curve linear velocity (m/s)      |
+| `--w_curve`     | 2.5     | Curve angular velocity (rad/s)   |
+| `--curve_s`     | 15.0    | Curve segment duration (seconds) |
+
 ### Mode / Display
 | Parameter    | Default | Description                          |
 |--------------|---------|--------------------------------------|
@@ -119,6 +120,7 @@ python -m lab4.main --map warehouse_small --nav --goal_random --slam --direct
 | `--seed`     | None    | Random seed for reproducibility      |
 | `--autotest` | false   | Autotest mode                        |
 | `--max_sim_s`| 60.0    | Maximum simulation time (seconds)    |
+| `--speed`    | 8       | Physics speed multiplier             |
 
 ---
 
@@ -147,6 +149,7 @@ Available warehouse maps in `shared/maps/`:
 | `warehouse_small.txt`   | 30×50 | Small warehouse with racks and aisles |
 | `warehouse_medium.txt`  | 50×80 | Medium warehouse with office, charging zone, chicanes |
 | `warehouse_big.txt`     | 80×120 | Large warehouse with multiple zones |
+| `my_warehouse.txt`      | —      | Custom/user-generated warehouse |
 | `maze_lab4.txt`         | —      | Lab maze for testing |
 | `maze_realistic.txt`    | —      | Realistic maze |
 | `maze_realistic_x4.txt` | —      | Large realistic maze (4x scale) |
@@ -163,36 +166,51 @@ python -m shared.utils.gen_warehouse_map --size medium --out shared/maps/my_ware
 ```
 lab4/
 ├── main.py             # CLI entry point, argument parsing
-├── config.py           # SimConfig dataclass (all parameters)
-├── simulation.py       # Simulation engine (world, agents, humans, loop)
-├── agent.py            # RobotAgent (PF + Navigator + JobManager + SLAM)
-├── robot.py            # HuskyRobot (PyBullet URDF, differential drive)
-├── navigator.py        # A* path planning + pure-pursuit following
-├── planner_astar.py    # A* algorithm with grid inflation
-├── control.py          # Keyboard teleop controller
-├── odometry.py         # Differential-drive odometry
-├── job_manager.py      # Multi-job pick/drop queue manager
-├── human.py            # Simulated human pedestrian agent
-├── slam.py             # Occupancy grid SLAM (log-odds + Bresenham)
-├── world.py            # World coordinate conversions
+├── config.py           # SimConfig dataclass (all tunable parameters)
+├── simulation.py       # Simulation engine (world setup, multi-robot loop, humans, logging)
+├── agent.py            # RobotAgent (PF localization + Navigator + JobManager + SLAM)
+├── robot.py            # HuskyRobot (PyBullet Husky URDF, differential-drive v/w control)
+├── navigator.py        # A* path planning + pure-pursuit follower + collision avoidance
+├── planner_astar.py    # A* on 2D grid (4/8-connected) with Minkowski obstacle inflation
+├── control.py          # Keyboard teleop controller (WASD/ZQSD + arrows)
+├── odometry.py         # Differential-drive odometry (wheel encoder integration)
+├── job_manager.py      # Multi-job pick/drop queue with nearest-neighbor ordering
+├── human.py            # Simulated human pedestrian (capsule body, random waypoints)
+├── slam.py             # Occupancy grid SLAM (log-odds updates + Bresenham ray tracing)
+├── world.py            # Grid ↔ world coordinate conversions
+├── batch_runner.py     # Run N missions automatically, collect & summarize results
+├── analyze_runs.py     # Load run logs, generate PF error & trajectory plots
 
 shared/
 ├── maps/               # .txt grid maps (0=free, 1=wall)
-├── data/               # Run logs (timestamped folders)
+├── data/               # Run logs (timestamped folders: pf.csv, odometry.csv, summary.json)
 └── utils/
-    ├── grid_map.py         # Grid loader + simulated lidar
-    ├── maze_builder.py     # PyBullet wall builder from grid
-    ├── particle_filter.py  # Monte Carlo Localization (MCL)
-    ├── spawn.py            # Spawn point finder
-    ├── logger.py           # CSV/JSON run logger
+    ├── grid_map.py         # Grid loader + simulated ray-marching lidar
+    ├── maze_builder.py     # PyBullet wall builder from grid (box collision shapes)
+    ├── particle_filter.py  # Monte Carlo Localization (systematic resampling)
+    ├── spawn.py            # Spawn point finder (top-of-map open area search)
+    ├── logger.py           # CSV run logger (timestamped directories)
     ├── map_picker.py       # Interactive/direct map selector
-    └── gen_warehouse_map.py# Warehouse map generator
+    └── gen_warehouse_map.py# Warehouse map generator (small/medium/big presets)
 ```
 
 ### Control Pipeline
 ```
-Odometry → PF Predict → Lidar Scan → PF Update → PF Estimate
-    → A* Plan → Waypoint Follower → (v, w) → Husky Differential Drive
+Wheel Encoders → DiffDrive Odometry (dC, dT)
+    → PF Predict (motion model + noise)
+    → Simulated Lidar Scan (ray-marching on grid)
+    → PF Update (Gaussian likelihood) → Systematic Resample
+    → PF Estimate (weighted mean)
+    → A* Plan (inflated grid, fallback to raw grid)
+    → Pure-Pursuit Follower + Collision Avoidance
+    → (v, w) → Husky Differential Drive
+```
+
+### Multi-Robot Priority System
+```
+Robot 0 yields to Robot 1, 2, 3, ...
+Robot 1 yields to Robot 2, 3, ...
+All robots always yield to humans.
 ```
 
 ---
@@ -209,11 +227,13 @@ Console output at end of run:
 ```
 === RESULT ===
   success:       True
-  sim_time:      42.30s
-  distance:      18.75m
-  mean_pf_error: 0.152m
-  gt_usage:      3.2%
+  sim_time:      120.02s
+  distance:      437.98m
+  mean_pf_error: 0.085m
+  gt_usage:      0.0%
 ```
+
+When SLAM is enabled, occupancy grid maps are saved as `slam_map_agent<id>.txt` in the project root.
 
 ---
 
