@@ -23,9 +23,9 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 class NavConfig:
     cell_size: float = 0.5
     lookahead_m: float = 0.6
-    v_nom: float = 1.0              # Moderate speed
-    w_max: float = 2.5
-    k_heading: float = 3.0
+    v_nom: float = 2.0              # Fast speed for 60s target
+    w_max: float = 3.0
+    k_heading: float = 3.5
     goal_tol_m: float = 0.6
     # Dynamic obstacle avoidance
     safety_radius: float = 0.35

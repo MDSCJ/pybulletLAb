@@ -15,7 +15,7 @@ class SimConfig:
 
     # Particle filter
     n_particles: int = 500
-    scan_period: float = 0.15
+    scan_period: float = 0.4
     n_lidar_rays: int = 36
     pf_init_std_xy: float = 0.5
     pf_init_std_th: float = 0.3
@@ -59,6 +59,9 @@ class SimConfig:
 
     # Multi-robot (Phase 5)
     n_robots: int = 1
+
+    # Speed multiplier
+    speed_multiplier: int = 8
 
     # SLAM (Phase 6)
     slam_enabled: bool = False

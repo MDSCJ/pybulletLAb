@@ -66,6 +66,9 @@ def main():
     # ── SLAM (Phase 6) ──
     parser.add_argument("--slam", action="store_true", help="Enable SLAM mode")
 
+    # ── Speed ──
+    parser.add_argument("--speed", type=int, default=8, help="Physics speed multiplier")
+
     args = parser.parse_args()
 
     # ── Resolve map ──
@@ -116,6 +119,7 @@ def main():
         n_humans=args.humans,
         n_robots=args.robots,
         slam_enabled=args.slam,
+        speed_multiplier=args.speed,
     )
 
     # ── Run ──

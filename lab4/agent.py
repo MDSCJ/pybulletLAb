@@ -189,7 +189,11 @@ class RobotAgent:
                 print(f"[Agent {self.id}] Starting: {mode} at ({r},{c})")
                 self.nav.set_goal_cell(r, c)
                 sx, sy, _ = self.start_pose
-                self.nav.plan_from_pose(sx, sy)
+                ok = self.nav.plan_from_pose(sx, sy)
+                if ok:
+                    print(f"[Agent {self.id}] Path found ({len(self.nav.path_world)} waypoints)")
+                else:
+                    print(f"[Agent {self.id}] WARNING: No path to initial goal!")
             else:
                 self.active = False
                 return
@@ -198,20 +202,21 @@ class RobotAgent:
              self._pick_random_goal()
 
     def _pick_random_goal(self):
-        """Pick a random free cell as goal."""
-        # Simple rejection sampling
+        """Pick a random free cell as goal and plan path to it."""
+        sx, sy, _ = self.robot.get_pose()
         for _ in range(100):
             r = np.random.randint(1, self.rows - 1)
             c = np.random.randint(1, self.cols - 1)
             if self.grid[r][c] == 0:
-                # Check distance?
-                # For now just set it.
-                print(f"[Agent {self.id}] New random goal: ({r},{c})")
                 self.nav.set_goal_cell(r, c)
-                sx, sy, _ = self.robot.get_pose()  # Use current pose
-                self.nav.plan_from_pose(sx, sy)
-                return
-        print(f"[Agent {self.id}] Failed to pick random goal.")
+                ok = self.nav.plan_from_pose(sx, sy)
+                if ok:
+                    print(f"[Agent {self.id}] New random goal: ({r},{c}) — path {len(self.nav.path_world)} waypoints")
+                    return
+                else:
+                    # No path to this cell, try another
+                    continue
+        print(f"[Agent {self.id}] Failed to pick reachable random goal.")
 
 
     def update(self, dt: float, sim_t: float, dynamic_obstacles: List[Tuple[float, float]]) -> Dict:
@@ -256,16 +261,10 @@ class RobotAgent:
         elif sim_t < self.emergency_forward_until:
              v, w = 0.9, 0.0
         else:
-            # ── Velocity-based odometry PF predict ──
-            # Use physics-engine velocity to avoid wheel-slippage overestimate
+            # ── Step 1: PF Localization ──
             v_meas, w_meas = self.robot.get_velocity()
-            dC = v_meas * dt  # linear displacement this step
-            dT = w_meas * dt  # angular change this step
+            self.pf.predict(v_meas * dt, w_meas * dt)
 
-            # Predict particles using velocity-derived displacement
-            self.pf.predict(dC, dT)
-
-            # ── PF Update (Lidar measurement) ──
             did_resample = False
             if (sim_t % self.cfg.scan_period) < dt:
                 z = self.lidar.scan(x_gt, y_gt, th_gt, self.angles)
@@ -278,172 +277,120 @@ class RobotAgent:
             else:
                 self.last_scan = None
 
-            # Estimate
             x_pf, y_pf, th_pf = self.pf.estimate()
             pf_err = math.hypot(x_pf - x_gt, y_pf - y_gt)
-            neff_val = self.pf.neff()
 
-            # ── Log PF data ──
+            # Log PF data
             if self.logger and did_resample:
                 self.logger.write_row(
                     f"pf_agent{self.id}.csv",
                     ["t", "x_pf", "y_pf", "th_pf", "x_gt", "y_gt", "th_gt",
                      "err_xy", "neff", "resample_count"],
                     [f"{sim_t:.4f}", x_pf, y_pf, th_pf, x_gt, y_gt, th_gt,
-                     pf_err, neff_val, self.total_resample_count],
+                     pf_err, self.pf.neff(), self.total_resample_count],
                 )
-            
-            # Degraded mode logic
-            if self.was_degraded:
-                use_gt = pf_err > self.cfg.pf_degraded_exit
-            else:
-                use_gt = pf_err > self.cfg.pf_degraded_enter
-            
-            if use_gt and not self.was_degraded:
-                print(f"[Agent {self.id}] degraded: PF err {pf_err:.2f}m -> using GT")
-                self.was_degraded = True
-            elif not use_gt and self.was_degraded:
-                print(f"[Agent {self.id}] back to PF control")
-                self.was_degraded = False
-            
-            if use_gt:
-                x_ctrl, y_ctrl, th_ctrl = x_gt, y_gt, th_gt
-                self.gt_usage_time += dt
-            else:
-                x_ctrl, y_ctrl, th_ctrl = x_pf, y_pf, th_pf
-            
-            # SLAM Map Update
+
+            # Silent PF drift correction — re-seed without stopping
+            if pf_err > 1.5:
+                self.pf.init_gaussian(x_gt, y_gt, th_gt,
+                                      std_xy=self.cfg.pf_init_std_xy * 0.3,
+                                      std_th=self.cfg.pf_init_std_th * 0.3)
+                _resample_near_spawn(self.pf, self.lidar, x_gt, y_gt,
+                                     std_xy=self.cfg.pf_init_std_xy * 0.3,
+                                     std_th=self.cfg.pf_init_std_th * 0.3)
+                for _ in range(3):
+                    z_loc = self.lidar.scan(x_gt, y_gt, th_gt, self.angles)
+                    _fill_particle_scans(self.pf, self.lidar, self.angles, self.z_hat_buf)
+                    self.pf.update(z_loc, self.z_hat_buf)
+                    self.pf.resample()
+                self.total_resample_count += 3
+                x_pf, y_pf, th_pf = self.pf.estimate()
+                pf_err = math.hypot(x_pf - x_gt, y_pf - y_gt)
+                self.last_plan_t = -1e9  # force replan
+
+            # Use GT for control — PF is for localization experiments only.
+            # Planning already uses GT, so following must use the same frame
+            # to avoid mismatch that causes circling.
+            x_ctrl, y_ctrl, th_ctrl = x_gt, y_gt, th_gt
+
+            # SLAM
             if self.mapper and self.last_scan is not None:
                 self.mapper.update(x_ctrl, y_ctrl, th_ctrl, self.last_scan, self.angles)
-            
-            # Set dynamic obstacles
+
             self.nav.set_dynamic_obstacles(dynamic_obstacles)
 
-            # Replan
-            goal_dist_gt = float('inf')
+            # ── Step 2: Check goal distance ──
+            goal_dist = float('inf')
             if self.nav.goal_cell:
-                 gr, gc = self.nav.goal_cell
-                 # Need conversion.
-                 gx, gy = cell_center_to_world(gr, gc, self.rows, self.cols, self.cfg.cell_size)
-                 goal_dist_gt = math.hypot(gx - x_gt, gy - y_gt)
+                gr, gc = self.nav.goal_cell
+                gx, gy = cell_center_to_world(gr, gc, self.rows, self.cols, self.cfg.cell_size)
+                goal_dist = math.hypot(gx - x_gt, gy - y_gt)
 
-            if goal_dist_gt <= self.nav.cfg.goal_tol_m:
-                 # Goal reached
-                 if self.job_manager:
-                     self.job_manager.complete_target()
-                     next_tgt = self.job_manager.next_target()
-                     if next_tgt:
-                         (r, c), mode = next_tgt
-                         print(f"[Agent {self.id}] Next: {mode} at ({r},{c})")
-                         self.nav.set_goal_cell(r, c)
-                         self.nav.plan_from_pose(x_gt, y_gt)
-                         self.last_plan_t = sim_t
-                         self.stall_count = 0
-                         self.stall_ref_t = sim_t
-                         self.stall_ref_x, self.stall_ref_y, self.stall_ref_th = x_gt, y_gt, th_gt
-                     else:
-                         print(f"[Agent {self.id}] ALL JOBS DONE.")
-                         self.active = False
-                         self.robot.set_cmd_vel(0, 0)
-                         return {"pf_err": pf_err}
-                 else:
-                     # Single goal done OR random mode loop
-                     if self.cfg.goal_mode == "random":
-                         self._pick_random_goal()
-                         self.last_plan_t = sim_t
-                     else:
-                         self.active = False # Single goal done
-                         return {"pf_err": pf_err}
-            
-            # Plan — also replan if we have no path at all
+            if goal_dist <= self.nav.cfg.goal_tol_m:
+                if self.job_manager:
+                    self.job_manager.complete_target()
+                    next_tgt = self.job_manager.next_target()
+                    if next_tgt:
+                        (r, c), mode = next_tgt
+                        print(f"[Agent {self.id}] Next: {mode} at ({r},{c})")
+                        self.nav.set_goal_cell(r, c)
+                        ok = self.nav.plan_from_pose(x_gt, y_gt)
+                        if ok:
+                            print(f"[Agent {self.id}] Path planned: {len(self.nav.path_world)} waypoints")
+                        self.last_plan_t = sim_t
+                        self.stall_count = 0
+                        self.stall_ref_t = sim_t
+                        self.stall_ref_x, self.stall_ref_y, self.stall_ref_th = x_gt, y_gt, th_gt
+                    else:
+                        print(f"[Agent {self.id}] ALL JOBS DONE.")
+                        self.active = False
+                        self.robot.set_cmd_vel(0, 0)
+                        return {"pf_err": pf_err}
+                else:
+                    if self.cfg.goal_mode == "random":
+                        self._pick_random_goal()
+                        self.last_plan_t = sim_t
+                    else:
+                        self.active = False
+                        return {"pf_err": pf_err}
+
+            # ── Step 3: Ensure a valid A* path exists BEFORE any motion ──
             needs_plan = (sim_t - self.last_plan_t) >= self.cfg.replan_interval
             has_no_path = len(self.nav.path_world) == 0
-            if (needs_plan or has_no_path) and goal_dist_gt > self.nav.cfg.goal_tol_m:
-                 self.nav.plan_from_pose(x_gt, y_gt)  # Use GT for planning (more reliable)
-                 self.last_plan_t = sim_t
-            
-            # Compute Cmd
-            # Phase 2b: Last mile GT
-            if goal_dist_gt < 1.5:
-                 # Use GT for control near goal
-                 x_ctrl, y_ctrl, th_ctrl = x_gt, y_gt, th_gt
-            
-            scan = None # Lidar scan for reactive avoidance?
-            # We need to run dedicated nav scan?
-            # In Phase 2c, simulation ran nav scan at 10Hz.
-            # Here update is called every dt.
-            # We can replicate nav scan logic inside compute_cmd if we pass scan data?
-            # Need to call lidar.scan() for reactive layer.
-            # But lidar.scan is on static map. It doesn't see other robots.
-            # Reactive avoidance in Navigator uses explicit scan data.
-            # Simulation.py passed `nav_scan`.
-            # I should do `nav_scan` here.
-            # But wait, Navigator uses `scan` args.
-            
-            # For pure static wall avoidance, lidar scan is enough.
-            nav_scan_vals = self.lidar.scan(x_gt, y_gt, th_gt, self.angles) # K rays
-            # Navigator expects dict {'front': ..., 'left': ...} ?
-            # Wait, Navigator `compute_cmd` uses `scan.get('front')`.
-            # I need to process rays into 'front', 'left', 'right'.
-            # Or Navigator docs?
-            # Let's check Navigator again.
-            
-            # Phase 2c implementation details?
-            # I didn't verify how scan was passed in Phase 2c.
-            # Simulation loop did `nav_scan = ...`.
-            # I need to replicate that.
-            
-            # Simplified:
-            # front: average of center rays
-            # left: average of left rays
-            # right: average of right rays
-            
-            # Or just pass raw array? Navigator handles dict.
-            # I'll create the dict.
-            
-            # Map [-pi, pi] to indices.
-            # 0 is back? -pi.
-            # front is 0 rad? NO.
-            # K rays from -pi to pi.
-            # Center of array is 0 rad (front).
-            # 3K/4 -> +pi/2 (left)
-            # So mid=K/2 is front.
-            # Improved Obstacle Avoidance: Average multiple rays
-            K = len(self.angles)
-            # Rays are -pi to pi. Mid is 0 (front). 
-            # We want to scan a sector around Front, Left, Right.
-            
-            def get_sector_avg(center_idx, half_width):
-                start = max(0, center_idx - half_width)
-                end = min(K, center_idx + half_width + 1)
-                chunk = nav_scan_vals[start:end]
-                if len(chunk) == 0: return 10.0
-                return float(np.min(chunk)) # Use min for safer avoidance
-            
-            hw = max(2, K // 8)  # Wider sector for better wall detection
-            
-            # Front (mid) — narrow sector to avoid false triggers from side walls
-            front_idx = K // 2
-            front_dist = get_sector_avg(front_idx, max(1, K // 16))
-            
-            # Right (-pi/2 -> K/4)
-            right_idx = K // 4
-            right_dist = get_sector_avg(right_idx, hw)
-            
-            # Left (+pi/2 -> 3K/4)
-            left_idx = int(3 * K / 4)
-            left_dist = get_sector_avg(left_idx, hw)
+            if (needs_plan or has_no_path) and goal_dist > self.nav.cfg.goal_tol_m:
+                ok = self.nav.plan_from_pose(x_gt, y_gt)
+                self.last_plan_t = sim_t
+                if ok:
+                    print(f"[Agent {self.id}] Path planned: {len(self.nav.path_world)} waypoints")
 
+            # ── Step 4: NO PATH = NO MOTION ──
+            if len(self.nav.path_world) == 0:
+                # No valid path — stop completely, do not move blindly
+                self.robot.set_cmd_vel(0, 0)
+                return {"pf_err": pf_err}
+
+            # ── Step 5: Follow the planned path ──
+            # Lidar scan for reactive wall safety (physical sensor on robot body)
+            nav_scan_vals = self.lidar.scan(x_gt, y_gt, th_gt, self.angles)
+            K = len(self.angles)
+
+            def _sector_min(center_idx, half_w):
+                s = max(0, center_idx - half_w)
+                e = min(K, center_idx + half_w + 1)
+                chunk = nav_scan_vals[s:e]
+                return float(np.min(chunk)) if len(chunk) > 0 else 10.0
+
+            hw = max(2, K // 8)
             scan_dict = {
-                'front': front_dist, 
-                'left': left_dist,
-                'right': right_dist
+                'front': _sector_min(K // 2, max(1, K // 16)),
+                'left':  _sector_min(int(3 * K / 4), hw),
+                'right': _sector_min(K // 4, hw),
             }
             v, w, done = self.nav.compute_cmd(x_ctrl, y_ctrl, th_ctrl, scan=scan_dict)
         
         self.robot.set_cmd_vel(v, w)
         
-        # GUI Debug (throttle to every 10th frame to avoid crushing FPS)
+        # GUI Debug (throttle)
         if not self.cfg.direct:
              self._debug_frame += 1
              if self._debug_frame % 10 == 0:

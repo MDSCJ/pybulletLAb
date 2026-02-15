@@ -21,9 +21,9 @@ class SimulatedHuman:
         self.cell_size = cell_size
         self.rng = random.Random(seed) if seed is not None else random.Random()
 
-        # Physics body (Capsule) — sized to fit corridors
-        radius = 0.15
-        height = 1.5
+        # Physics body (Capsule)
+        radius = 0.25
+        height = 1.7
         visual_shape = p.createVisualShape(
             p.GEOM_CAPSULE, radius=radius, length=height, 
             rgbaColor=[0.2, 0.8, 0.2, 1], physicsClientId=cid)
@@ -39,7 +39,7 @@ class SimulatedHuman:
         )
         
         # Behavior
-        self.speed = 0.4  # m/s
+        self.speed = 1.0  # m/s
         self.target: Optional[Tuple[float, float]] = None
         self._pick_new_target()
 
@@ -64,19 +64,13 @@ class SimulatedHuman:
         vx = self.speed * math.cos(heading)
         vy = self.speed * math.sin(heading)
         
-        # Move kinematically: compute new position directly
-        step = min(self.speed * dt, dist)  # don't overshoot
-        nx = x + step * math.cos(heading)
-        ny = y + step * math.sin(heading)
+        # Set velocity (kinematic-ish control via linear velocity)
+        # Keep Z velocity existing (gravity)
+        lin_vel, ang_vel = p.getBaseVelocity(self.body_id, physicsClientId=self.cid)
+        p.resetBaseVelocity(self.body_id, [vx, vy, lin_vel[2]], [0, 0, 0], physicsClientId=self.cid)
         
-        # Keep upright, move to new position
-        p.resetBasePositionAndOrientation(
-            self.body_id, [nx, ny, pos[2]], [0, 0, 0, 1],
-            physicsClientId=self.cid)
-        # Set velocity so physics engine knows about movement (for collision)
-        p.resetBaseVelocity(
-            self.body_id, [vx, vy, 0], [0, 0, 0],
-            physicsClientId=self.cid)
+        # Keep upright
+        p.resetBasePositionAndOrientation(self.body_id, [x, y, pos[2]], [0, 0, 0, 1], physicsClientId=self.cid)
 
     def get_pose(self) -> Tuple[float, float, float, float]:
         """Returns x, y, vx, vy."""

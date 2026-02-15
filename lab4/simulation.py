@@ -5,7 +5,6 @@ Handles: world setup, multi-robot management, human obstacles, logging.
 from __future__ import annotations
 
 import math
-import json
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
@@ -64,47 +63,48 @@ class Simulation:
         self.agents: List[RobotAgent] = []
         n_robots = max(1, cfg.n_robots)
         print(f"[SIM] Spawning {n_robots} robots...")
-
-        # ── Logger (create early so agents can use it) ──
-        self.logger = RunLogger.create("shared/data")
         
         for i in range(n_robots):
+            # Find spawn point
+            # Use different seed or offset for each robot? 
+            # find_first_open_area_top returns deterministic result if unmodified grid?
+            # We can use 'free_block' logic with margin.
+            # Or use 'find_open_area' with random search if 'top' is occupied?
+            # Basic implementation: try to spawn effectively.
+            # If multiple robots, random spawn is better to avoid collision at start.
+            
             spawn_r, spawn_c = 0, 0
             if i == 0:
+                 # First robot at top (standard)
                 try:
                      spawn_r, spawn_c = find_first_open_area_top(self.grid, free_block=6, margin=1)
                 except RuntimeError:
                      try:
                          spawn_r, spawn_c = find_first_open_area_top(self.grid, free_block=4, margin=1)
                      except RuntimeError:
+                         # Fallback for tight mazes
                          try:
                              spawn_r, spawn_c = find_first_open_area_top(self.grid, free_block=2, margin=0)
                          except RuntimeError:
-                             # Tight maze: find first free cell scanning top-to-bottom
-                             found = False
-                             for rr in range(1, self.rows - 1):
-                                 for cc in range(1, self.cols - 1):
-                                     if self.grid[rr][cc] == 0:
-                                         spawn_r, spawn_c = rr, cc
-                                         found = True
-                                         break
-                                 if found:
+                             # Last resort: find ANY free cell
+                             print("[SIM] Warning: random spawn fallback!")
+                             while True:
+                                 spawn_r = self.rng.integers(1, self.rows-2)
+                                 spawn_c = self.rng.integers(1, self.cols-2)
+                                 if self.grid[spawn_r][spawn_c] == 0:
                                      break
             else:
+                 # Subsequent robots random specific logic
                  spawn_r = self.rng.integers(1, self.rows-2)
                  spawn_c = self.rng.integers(1, self.cols-2)
                  while self.grid[spawn_r][spawn_c] != 0:
                       spawn_r = self.rng.integers(1, self.rows-2)
                       spawn_c = self.rng.integers(1, self.cols-2)
 
-            # Detect corridor direction for spawn yaw
-            spawn_yaw = self._detect_corridor_yaw(spawn_r, spawn_c)
-
             sx, sy = cell_center_to_world(spawn_r, spawn_c, self.rows, self.cols, cfg.cell_size)
             
             # Create agent
-            agent = RobotAgent(i, self.cid, (sx, sy, spawn_yaw), self.grid, self.lidar, cfg,
-                               logger=self.logger)
+            agent = RobotAgent(i, self.cid, (sx, sy, 0.0), self.grid, self.lidar, cfg)
             self.agents.append(agent)
 
         # ── Humans (Phase 4) ──
@@ -121,12 +121,14 @@ class Simulation:
                      self.humans.append(SimulatedHuman(
                              self.cid, hx, hy, self.grid, cfg.cell_size, seed=i))
 
-        print(f"MAP: {cfg.map_path}")
-        print(f"Logs in: {self.logger.run_dir}")
-
-        # ── Draw Pick/Drop markers in GUI ──
+        # ── Draw pick/drop markers in GUI ──
         if not cfg.direct:
             self._draw_job_markers()
+
+        # ── Logger ──
+        self.logger = RunLogger.create("shared/data")
+        print(f"MAP: {cfg.map_path}")
+        print(f"Logs in: {self.logger.run_dir}")
 
         # ── Results ──
         self.result = {
@@ -137,62 +139,56 @@ class Simulation:
             "gt_usage_pct": 0.0,
         }
 
-    def _detect_corridor_yaw(self, r: int, c: int) -> float:
-        """Detect corridor direction at (r,c) and return a yaw aligned with it."""
-        free_h = 0  # horizontal free neighbors
-        free_v = 0  # vertical free neighbors
-        for dc in [-1, 1]:
-            cc = c + dc
-            if 0 <= cc < self.cols and self.grid[r][cc] == 0:
-                free_h += 1
-        for dr in [-1, 1]:
-            rr = r + dr
-            if 0 <= rr < self.rows and self.grid[rr][c] == 0:
-                free_v += 1
-        if free_h > free_v:
-            return 0.0            # horizontal corridor → face east (0 rad)
-        elif free_v > free_h:
-            return math.pi / 2    # vertical corridor → face north (π/2)
-        return 0.0                # open area or corner → default east
-
-    def shutdown(self):
-        p.disconnect(self.cid)
-
     def _draw_job_markers(self):
-        """Draw pick (blue) and drop (red) markers in the PyBullet GUI."""
+        """Draw pick (green) and drop (red) markers in the PyBullet GUI."""
         for agent in self.agents:
             if agent.job_manager is None:
                 continue
-            # Draw current job + queued jobs
+            # Collect all jobs (current + queued)
             all_jobs = []
-            if agent.job_manager.current_job:
+            if agent.job_manager.current_job is not None:
                 all_jobs.append(agent.job_manager.current_job)
             all_jobs.extend(agent.job_manager.jobs)
 
             for job in all_jobs:
-                # Pick marker — blue sphere
                 pr, pc = job.pick_cell
+                dr, dc = job.drop_cell
                 px, py = cell_center_to_world(pr, pc, self.rows, self.cols, self.cfg.cell_size)
-                vs_pick = p.createVisualShape(
-                    p.GEOM_SPHERE, radius=0.15,
-                    rgbaColor=[0, 0.4, 1, 0.8], physicsClientId=self.cid)
-                p.createMultiBody(baseMass=0, baseVisualShapeIndex=vs_pick,
-                                  basePosition=[px, py, 0.15], physicsClientId=self.cid)
-                p.addUserDebugText(f"P{job.id}", [px, py, 0.5],
-                                   textColorRGB=[0, 0.3, 1], textSize=1.2,
+                dx, dy = cell_center_to_world(dr, dc, self.rows, self.cols, self.cfg.cell_size)
+
+                # Pick marker — GREEN sphere + pillar
+                pick_vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.15,
+                                              rgbaColor=[0, 1, 0, 0.85],
+                                              physicsClientId=self.cid)
+                p.createMultiBody(baseMass=0, baseVisualShapeIndex=pick_vis,
+                                  basePosition=[px, py, 0.4],
+                                  physicsClientId=self.cid)
+                # Pillar line from ground to sphere
+                p.addUserDebugLine([px, py, 0.0], [px, py, 0.4],
+                                   lineColorRGB=[0, 0.8, 0], lineWidth=2,
+                                   lifeTime=0, physicsClientId=self.cid)
+                p.addUserDebugText(f"P{job.id}", [px, py, 0.65],
+                                   textColorRGB=[0, 0.6, 0], textSize=1.2,
                                    lifeTime=0, physicsClientId=self.cid)
 
-                # Drop marker — red sphere
-                dr, dc = job.drop_cell
-                dx, dy = cell_center_to_world(dr, dc, self.rows, self.cols, self.cfg.cell_size)
-                vs_drop = p.createVisualShape(
-                    p.GEOM_SPHERE, radius=0.15,
-                    rgbaColor=[1, 0.2, 0, 0.8], physicsClientId=self.cid)
-                p.createMultiBody(baseMass=0, baseVisualShapeIndex=vs_drop,
-                                  basePosition=[dx, dy, 0.15], physicsClientId=self.cid)
-                p.addUserDebugText(f"D{job.id}", [dx, dy, 0.5],
-                                   textColorRGB=[1, 0.2, 0], textSize=1.2,
+                # Drop marker — RED sphere + pillar
+                drop_vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.15,
+                                              rgbaColor=[1, 0, 0, 0.85],
+                                              physicsClientId=self.cid)
+                p.createMultiBody(baseMass=0, baseVisualShapeIndex=drop_vis,
+                                  basePosition=[dx, dy, 0.4],
+                                  physicsClientId=self.cid)
+                p.addUserDebugLine([dx, dy, 0.0], [dx, dy, 0.4],
+                                   lineColorRGB=[0.8, 0, 0], lineWidth=2,
                                    lifeTime=0, physicsClientId=self.cid)
+                p.addUserDebugText(f"D{job.id}", [dx, dy, 0.65],
+                                   textColorRGB=[0.6, 0, 0], textSize=1.2,
+                                   lifeTime=0, physicsClientId=self.cid)
+
+        print("[SIM] Pick (green) and Drop (red) markers drawn.")
+
+    def shutdown(self):
+        p.disconnect(self.cid)
 
     def run(self) -> dict:
         """Run the simulation. Returns a result dict."""
@@ -259,10 +255,11 @@ class Simulation:
                 total_distance += dist
                 last_poses[agent.id] = (ax_new, ay_new)
 
-            # ── Step Physics ──
-            p.stepSimulation(physicsClientId=self.cid)
+            # ── Step Physics (speed multiplier) ──
+            for _ in range(cfg.speed_multiplier):
+                p.stepSimulation(physicsClientId=self.cid)
             if not cfg.direct:
-                time.sleep(self.dt)
+                time.sleep(self.dt / max(1, cfg.speed_multiplier))
             
             sim_t += self.dt
             
@@ -276,39 +273,6 @@ class Simulation:
         self.result["distance"] = total_distance
         if total_pf_errors:
             self.result["mean_pf_error"] = float(np.mean(total_pf_errors))
-
-        # ── Compute GT usage percentage ──
-        total_gt_time = sum(a.gt_usage_time for a in self.agents)
-        n_active = max(1, len(self.agents))
-        if sim_t > 0:
-            self.result["gt_usage_pct"] = 100.0 * total_gt_time / (sim_t * n_active)
-
-        # ── Save mission summary JSON ──
-        summary = {
-            "success": self.result["success"],
-            "sim_time": round(sim_t, 3),
-            "distance": round(total_distance, 3),
-            "mean_pf_error": round(self.result["mean_pf_error"], 5),
-            "gt_usage_pct": round(self.result.get("gt_usage_pct", 0), 2),
-            "n_robots": cfg.n_robots,
-            "n_humans": cfg.n_humans,
-            "n_jobs": cfg.n_jobs,
-            "n_particles": cfg.n_particles,
-            "map": cfg.map_path,
-            "seed": cfg.seed,
-            "agents": [],
-        }
-        for agent in self.agents:
-            summary["agents"].append({
-                "id": agent.id,
-                "active": agent.active,
-                "gt_usage_time": round(agent.gt_usage_time, 3),
-                "total_resample_count": agent.total_resample_count,
-            })
-        summary_path = self.logger.run_dir / "summary.json"
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"[SIM] Summary saved to {summary_path}")
             
         # ── Save SLAM Maps ──
         for agent in self.agents:
