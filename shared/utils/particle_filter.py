@@ -106,6 +106,26 @@ class ParticleFilter:
         self.p = self.p[idx].copy()
         self.w[:] = 1.0 / n
 
+    # ── Kidnapped-robot recovery ──
+    def inject_random_particles(self, free_cells_xy: np.ndarray, frac: float = 0.05):
+        """
+        Replace *frac* of the lowest-weight particles with random samples
+        drawn uniformly from *free_cells_xy* (Nx2 array of (x,y) positions).
+        This gives the filter a chance to recover from kidnapping / severe drift
+        without needing ground-truth.
+        """
+        n_inject = max(1, int(self.cfg.n * frac))
+        if len(free_cells_xy) == 0:
+            return
+        # Pick the worst particles (lowest weight)
+        worst_idx = np.argsort(self.w)[:n_inject]
+        # Random free-space positions
+        chosen = free_cells_xy[np.random.randint(0, len(free_cells_xy), size=n_inject)]
+        self.p[worst_idx, 0] = chosen[:, 0]
+        self.p[worst_idx, 1] = chosen[:, 1]
+        self.p[worst_idx, 2] = np.random.uniform(-math.pi, math.pi, size=n_inject)
+        self.w[worst_idx] = 1.0 / self.cfg.n  # equal prior weight
+
 
     def estimate(self) -> tuple[float, float, float]:
         x = float(np.sum(self.p[:, 0] * self.w))
@@ -115,3 +135,47 @@ class ParticleFilter:
         c = float(np.sum(np.cos(self.p[:, 2]) * self.w))
         theta = math.atan2(s, c)
         return x, y, theta
+
+    def estimate_best_cluster(self, radius: float = 1.5) -> tuple[float, float, float, float]:
+        """Cluster-based estimate: find highest-weight particle, gather all
+        particles within *radius*, compute their weighted mean.
+
+        On symmetric maps (warehouse), the global weighted mean averages
+        between multiple modes and lands *between* them → huge error.
+        The cluster estimate picks the single best-supported mode → much
+        more accurate position even if there is perceptual aliasing.
+
+        Returns (x, y, theta, cluster_weight_fraction).
+        cluster_weight_fraction = sum of weights in cluster / total weight.
+        Use this as a quality metric for fusion gating.
+        """
+        best_i = int(np.argmax(self.w))
+        dx = self.p[:, 0] - self.p[best_i, 0]
+        dy = self.p[:, 1] - self.p[best_i, 1]
+        dists_sq = dx * dx + dy * dy
+        mask = dists_sq < (radius * radius)
+        n_in = int(mask.sum())
+
+        # Cluster weight fraction
+        w_total = float(np.sum(self.w))
+        if w_total <= 0:
+            w_total = 1.0
+
+        if n_in < 3:
+            # Cluster too small — fall back to MAP particle
+            cwf = float(self.w[best_i]) / w_total
+            return float(self.p[best_i, 0]), float(self.p[best_i, 1]), float(self.p[best_i, 2]), cwf
+
+        w_cluster = self.w[mask].astype(np.float64)
+        w_sum = w_cluster.sum()
+        cwf = float(w_sum) / w_total
+        if w_sum <= 0:
+            return float(self.p[best_i, 0]), float(self.p[best_i, 1]), float(self.p[best_i, 2]), 0.0
+
+        w_norm = w_cluster / w_sum
+        x = float(np.sum(self.p[mask, 0] * w_norm))
+        y = float(np.sum(self.p[mask, 1] * w_norm))
+        s = float(np.sum(np.sin(self.p[mask, 2]) * w_norm))
+        c = float(np.sum(np.cos(self.p[mask, 2]) * w_norm))
+        theta = math.atan2(s, c)
+        return x, y, theta, cwf

@@ -83,20 +83,32 @@ class RobotAgent:
         # ── Particle Filter ──
         pf_cfg = PFConfig(
             n=cfg.n_particles,
-            trans_noise_per_m=0.10,
-            rot_noise_per_rad=0.08,
-            trans_noise_min=0.002,
-            rot_noise_min=0.002,
-            meas_std=0.3,
+            trans_noise_per_m=0.04,
+            rot_noise_per_rad=0.03,
+            trans_noise_min=0.001,
+            rot_noise_min=0.001,
+            meas_std=0.40,             # balanced: discriminative but not particle-starved
         )
         self.pf = ParticleFilter(pf_cfg)
         self.pf.init_gaussian(sx, sy, sth, std_xy=cfg.pf_init_std_xy, std_th=cfg.pf_init_std_th)
         _resample_near_spawn(self.pf, lidar, sx, sy, std_xy=cfg.pf_init_std_xy, std_th=cfg.pf_init_std_th)
         
-        # Precompute ray angles
+        # Precompute ray angles (normal + dense for kidnapped-robot recovery)
         K = max(4, cfg.n_lidar_rays)
         self.angles = np.linspace(-math.pi, math.pi, K, endpoint=False).astype(np.float32)
         self.z_hat_buf = np.empty((cfg.n_particles, K), dtype=np.float32)
+
+        K_dense = max(K, cfg.pf_dense_scan_rays)
+        self.angles_dense = np.linspace(-math.pi, math.pi, K_dense, endpoint=False).astype(np.float32)
+        self.z_hat_buf_dense = np.empty((cfg.n_particles, K_dense), dtype=np.float32)
+        self._scan_count = 0  # counter for dense-scan scheduling
+
+        # Precompute free-space cell centres for kidnapped-robot injection
+        free_rc = [(r, c) for r in range(self.rows) for c in range(self.cols)
+                   if grid[r][c] == 0]
+        self._free_cells_xy = np.array(
+            [cell_center_to_world(r, c, self.rows, self.cols, cfg.cell_size)
+             for r, c in free_rc], dtype=np.float32) if free_rc else np.empty((0, 2), dtype=np.float32)
 
         # ── Navigator ──
         # Scale safety radii to robot size
@@ -136,6 +148,7 @@ class RobotAgent:
         self.last_plan_t = -1e9
         self.stall_count = 0
         self.stall_ref_t = 0.0
+        # Stall tracking uses PF estimate (initialised from start pose)
         self.stall_ref_x = sx
         self.stall_ref_y = sy
         self.stall_ref_th = sth
@@ -209,19 +222,30 @@ class RobotAgent:
 
     def _pick_random_goal(self):
         """Pick a random free cell as goal and plan path to it."""
-        sx, sy, _ = self.robot.get_pose()
+        # Use odometry for current position; if odom cell is invalid (drifted
+        # into a wall cell), snap to the nearest free cell.
+        ox, oy = self.odom.x, self.odom.y
+        cr, cc = world_to_cell(ox, oy, self.rows, self.cols, self.cfg.cell_size)
+        if cr < 0 or cr >= self.rows or cc < 0 or cc >= self.cols or self.grid[cr][cc] != 0:
+            # Odom position is in a wall / out of bounds — find nearest free cell
+            best_d = float('inf')
+            for r in range(self.rows):
+                for c in range(self.cols):
+                    if self.grid[r][c] == 0:
+                        fx, fy = cell_center_to_world(r, c, self.rows, self.cols, self.cfg.cell_size)
+                        d = math.hypot(fx - ox, fy - oy)
+                        if d < best_d:
+                            best_d = d
+                            ox, oy = fx, fy
         for _ in range(100):
             r = np.random.randint(1, self.rows - 1)
             c = np.random.randint(1, self.cols - 1)
             if self.grid[r][c] == 0:
                 self.nav.set_goal_cell(r, c)
-                ok = self.nav.plan_from_pose(sx, sy)
+                ok = self.nav.plan_from_pose(ox, oy)
                 if ok:
                     print(f"[Agent {self.id}] New random goal: ({r},{c}) — path {len(self.nav.path_world)} waypoints")
                     return
-                else:
-                    # No path to this cell, try another
-                    continue
         print(f"[Agent {self.id}] Failed to pick reachable random goal.")
 
 
@@ -234,13 +258,17 @@ class RobotAgent:
             self.robot.set_cmd_vel(0, 0)
             return {}
 
-        x_gt, y_gt, th_gt = self.robot.get_pose()
+        x_gt, y_gt, th_gt = self.robot.get_pose()  # GT kept for logging/metrics only
         pf_err = 0.0
-        
-        # ── Stall detection (check every 2 seconds) ──
+
+        # ── Update odometry from wheel encoders (no GT) ──
+        left_ang, right_ang = self.robot.get_left_right_wheel_angles()
+        x_odom, y_odom, th_odom, dC_odom, dT_odom = self.odom.update_from_wheels(left_ang, right_ang)
+
+        # ── Stall detection (uses odometry estimate, not GT) ──
         if (sim_t - self.stall_ref_t) >= 2.0:
-            dist_moved = math.hypot(x_gt - self.stall_ref_x, y_gt - self.stall_ref_y)
-            rot_moved = abs(_wrap(th_gt - self.stall_ref_th))
+            dist_moved = math.hypot(x_odom - self.stall_ref_x, y_odom - self.stall_ref_y)
+            rot_moved = abs(_wrap(th_odom - self.stall_ref_th))
             
             if dist_moved < 0.10 and rot_moved < 0.15:
                 self.stall_count += 1
@@ -255,69 +283,101 @@ class RobotAgent:
             else:
                 self.stall_count = 0
             self.stall_ref_t = sim_t
-            self.stall_ref_x = x_gt
-            self.stall_ref_y = y_gt
-            self.stall_ref_th = th_gt
+            self.stall_ref_x = x_odom
+            self.stall_ref_y = y_odom
+            self.stall_ref_th = th_odom
+
+        # ── PF predict: always advance particles with wheel-encoder deltas,
+        #    even during backup/emergency.  Skipping this caused PF to fall
+        #    behind odometry, making fusion impossible afterwards. ──
+        self.pf.predict(dC_odom, dT_odom)
 
         # ── Control Logic ──
         v, w = 0.0, 0.0
+        did_resample = False
+        neff_val = self.pf.neff()
         
         if sim_t < self.backup_until:
              v, w = -0.4, getattr(self, '_backup_w', -1.0)
         elif sim_t < self.emergency_forward_until:
              v, w = 0.9, 0.0
         else:
-            # ── Step 1: PF Localization ──
-            v_meas, w_meas = self.robot.get_velocity()
-            self.pf.predict(v_meas * dt, w_meas * dt)
-
-            did_resample = False
             if (sim_t % self.cfg.scan_period) < dt:
-                z = self.lidar.scan(x_gt, y_gt, th_gt, self.angles)
-                _fill_particle_scans(self.pf, self.lidar, self.angles, self.z_hat_buf)
-                self.pf.update(z, self.z_hat_buf)
+                self._scan_count += 1
+
+                # Decide whether this is a dense scan (more rays → better re-localisation)
+                use_dense = (self._scan_count % self.cfg.pf_dense_scan_interval == 0)
+                if use_dense:
+                    angles_cur = self.angles_dense
+                    z_buf_cur  = self.z_hat_buf_dense
+                else:
+                    angles_cur = self.angles
+                    z_buf_cur  = self.z_hat_buf
+
+                # Measurement scan: comes from the robot's physical sensor
+                # (= GT in simulation — this is the sensor reading, NOT a GT dependency
+                #  for control.  A real robot's lidar fires from its true body frame.)
+                z = self.lidar.scan(x_gt, y_gt, th_gt, angles_cur)
+
+                # Kidnapped-robot recovery: inject random free-space particles
+                # BEFORE update so they get properly scored by the measurement model.
+                # Bad guesses will receive low weights and be eliminated in resample.
+                self.pf.inject_random_particles(
+                    self._free_cells_xy, frac=self.cfg.pf_random_inject_pct)
+
+                _fill_particle_scans(self.pf, self.lidar, angles_cur, z_buf_cur)
+                self.pf.update(z, z_buf_cur)
+
+                # Record Neff BEFORE resample (meaningful weight diversity metric)
+                neff_val = self.pf.neff()
+
+                # Compute PF estimate BEFORE resample — weights are still
+                # informative (reflect measurement likelihood).  Use cluster-
+                # based estimate to avoid averaging between symmetric modes.
+                x_pf, y_pf, th_pf, cluster_wf = self.pf.estimate_best_cluster(radius=1.5)
+
                 self.pf.resample()
+
                 did_resample = True
                 self.total_resample_count += 1
-                self.last_scan = z
+                self.last_scan = z if not use_dense else self.lidar.scan(x_gt, y_gt, th_gt, self.angles)
             else:
                 self.last_scan = None
 
-            x_pf, y_pf, th_pf = self.pf.estimate()
+            if not did_resample:
+                x_pf, y_pf, th_pf, cluster_wf = self.pf.estimate_best_cluster(radius=1.5)
             pf_err = math.hypot(x_pf - x_gt, y_pf - y_gt)
 
-            # Log PF data
+            # Log PF data (GT logged for metrics/debug only)
             if self.logger and did_resample:
+                th_err = abs(_wrap(th_pf - th_gt))
+                odom_err = math.hypot(x_odom - x_gt, y_odom - y_gt)
                 self.logger.write_row(
                     f"pf_agent{self.id}.csv",
                     ["t", "x_pf", "y_pf", "th_pf", "x_gt", "y_gt", "th_gt",
-                     "err_xy", "neff", "resample_count"],
+                     "err_xy", "err_th", "neff", "resample_count",
+                     "x_odom", "y_odom", "th_odom", "err_odom"],
                     [f"{sim_t:.4f}", x_pf, y_pf, th_pf, x_gt, y_gt, th_gt,
-                     pf_err, self.pf.neff(), self.total_resample_count],
+                     pf_err, th_err, neff_val, self.total_resample_count,
+                     x_odom, y_odom, th_odom, odom_err],
                 )
 
-            # Silent PF drift correction — re-seed without stopping
-            if pf_err > 1.5:
-                self.pf.init_gaussian(x_gt, y_gt, th_gt,
-                                      std_xy=self.cfg.pf_init_std_xy * 0.3,
-                                      std_th=self.cfg.pf_init_std_th * 0.3)
-                _resample_near_spawn(self.pf, self.lidar, x_gt, y_gt,
-                                     std_xy=self.cfg.pf_init_std_xy * 0.3,
-                                     std_th=self.cfg.pf_init_std_th * 0.3)
-                for _ in range(3):
-                    z_loc = self.lidar.scan(x_gt, y_gt, th_gt, self.angles)
-                    _fill_particle_scans(self.pf, self.lidar, self.angles, self.z_hat_buf)
-                    self.pf.update(z_loc, self.z_hat_buf)
-                    self.pf.resample()
-                self.total_resample_count += 3
-                x_pf, y_pf, th_pf = self.pf.estimate()
-                pf_err = math.hypot(x_pf - x_gt, y_pf - y_gt)
-                self.last_plan_t = -1e9  # force replan
+            # ── Control pose: odometry corrected by PF when confident ──
+            # Gates to prevent bad fusion on symmetric maps:
+            #  1. cluster_wf > 5%   — PF cluster has dominant weight
+            #  2. proximity < 3m    — PF agrees with odom (prevents wrong-mode pull)
+            #  3. adaptive alpha    — stronger correction when more confident
+            if did_resample and cluster_wf > 0.05:
+                dx = x_pf - x_odom
+                dy = y_pf - y_odom
+                dist_pf_odom = math.hypot(dx, dy)
+                if dist_pf_odom < 5.0:  # proximity gate: only fuse when PF & odom agree
+                    alpha = min(0.30, cluster_wf * 0.5)
+                    self.odom.x += alpha * dx
+                    self.odom.y += alpha * dy
+                    x_odom, y_odom, th_odom = self.odom.x, self.odom.y, self.odom.theta
 
-            # Use GT for control — PF is for localization experiments only.
-            # Planning already uses GT, so following must use the same frame
-            # to avoid mismatch that causes circling.
-            x_ctrl, y_ctrl, th_ctrl = x_gt, y_gt, th_gt
+            x_ctrl, y_ctrl, th_ctrl = x_odom, y_odom, th_odom
 
             # SLAM
             if self.mapper and self.last_scan is not None:
@@ -325,12 +385,12 @@ class RobotAgent:
 
             self.nav.set_dynamic_obstacles(dynamic_obstacles, obstacle_types)
 
-            # ── Step 2: Check goal distance ──
+            # ── Step 2: Check goal distance (PF estimate) ──
             goal_dist = float('inf')
             if self.nav.goal_cell:
                 gr, gc = self.nav.goal_cell
                 gx, gy = cell_center_to_world(gr, gc, self.rows, self.cols, self.cfg.cell_size)
-                goal_dist = math.hypot(gx - x_gt, gy - y_gt)
+                goal_dist = math.hypot(gx - x_ctrl, gy - y_ctrl)
 
             if goal_dist <= self.nav.cfg.goal_tol_m:
                 if self.job_manager:
@@ -340,13 +400,13 @@ class RobotAgent:
                         (r, c), mode = next_tgt
                         print(f"[Agent {self.id}] Next: {mode} at ({r},{c})")
                         self.nav.set_goal_cell(r, c)
-                        ok = self.nav.plan_from_pose(x_gt, y_gt)
+                        ok = self.nav.plan_from_pose(x_ctrl, y_ctrl)
                         if ok:
                             print(f"[Agent {self.id}] Path planned: {len(self.nav.path_world)} waypoints")
                         self.last_plan_t = sim_t
                         self.stall_count = 0
                         self.stall_ref_t = sim_t
-                        self.stall_ref_x, self.stall_ref_y, self.stall_ref_th = x_gt, y_gt, th_gt
+                        self.stall_ref_x, self.stall_ref_y, self.stall_ref_th = x_ctrl, y_ctrl, th_ctrl
                     else:
                         print(f"[Agent {self.id}] ALL JOBS DONE.")
                         self.active = False
@@ -364,7 +424,7 @@ class RobotAgent:
             needs_plan = (sim_t - self.last_plan_t) >= self.cfg.replan_interval
             has_no_path = len(self.nav.path_world) == 0
             if (needs_plan or has_no_path) and goal_dist > self.nav.cfg.goal_tol_m:
-                ok = self.nav.plan_from_pose(x_gt, y_gt)
+                ok = self.nav.plan_from_pose(x_ctrl, y_ctrl)
                 self.last_plan_t = sim_t
                 if ok:
                     print(f"[Agent {self.id}] Path planned: {len(self.nav.path_world)} waypoints")
@@ -376,7 +436,7 @@ class RobotAgent:
                 return {"pf_err": pf_err}
 
             # ── Step 5: Follow the planned path ──
-            # Lidar scan for reactive wall safety (physical sensor on robot body)
+            # Lidar scan for reactive wall safety (physical sensor on robot body = GT in sim)
             nav_scan_vals = self.lidar.scan(x_gt, y_gt, th_gt, self.angles)
             K = len(self.angles)
 
@@ -387,8 +447,11 @@ class RobotAgent:
                 return float(np.min(chunk)) if len(chunk) > 0 else 10.0
 
             hw = max(2, K // 8)
+            # Front sector: ±K//6 rays ≈ ±30° so walls approached at an
+            # angle are detected early (was ±K//16 ≈ ±10° — far too narrow).
+            front_hw = max(2, K // 6)
             scan_dict = {
-                'front': _sector_min(K // 2, max(1, K // 16)),
+                'front': _sector_min(K // 2, front_hw),
                 'left':  _sector_min(int(3 * K / 4), hw),
                 'right': _sector_min(K // 4, hw),
             }

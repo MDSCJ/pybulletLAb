@@ -59,6 +59,11 @@ class Simulation:
         self.rows = len(self.grid)
         self.cols = len(self.grid[0])
 
+        # ── Logger (created early so agents can use it) ──
+        self.logger = RunLogger.create("shared/data")
+        print(f"MAP: {cfg.map_path}")
+        print(f"Logs in: {self.logger.run_dir}")
+
         # ── Agents (Phase 5) ──
         self.agents: List[RobotAgent] = []
         n_robots = max(1, cfg.n_robots)
@@ -104,7 +109,8 @@ class Simulation:
             sx, sy = cell_center_to_world(spawn_r, spawn_c, self.rows, self.cols, cfg.cell_size)
             
             # Create agent
-            agent = RobotAgent(i, self.cid, (sx, sy, 0.0), self.grid, self.lidar, cfg)
+            agent = RobotAgent(i, self.cid, (sx, sy, 0.0), self.grid, self.lidar, cfg,
+                               logger=self.logger)
             self.agents.append(agent)
 
         # ── Humans (Phase 4) ──
@@ -124,11 +130,6 @@ class Simulation:
         # ── Draw pick/drop markers in GUI ──
         if not cfg.direct:
             self._draw_job_markers()
-
-        # ── Logger ──
-        self.logger = RunLogger.create("shared/data")
-        print(f"MAP: {cfg.map_path}")
-        print(f"Logs in: {self.logger.run_dir}")
 
         # ── Results ──
         self.result = {

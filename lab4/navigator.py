@@ -36,10 +36,10 @@ class NavConfig:
     # Legacy parameters (kept for backward compatibility)
     safety_radius: float = 0.35
     slowdown_radius: float = 0.70
-    # Wall avoidance thresholds (will be scaled to cell_size in Navigator.__init__)
+    # Wall avoidance thresholds (reasonable for 0.5m cells / 1.0m corridors)
     wall_front_stop: float = 0.35     # Full stop if wall ahead closer than this
-    wall_front_slow: float = 0.60     # Start slowing if wall ahead closer than this
-    wall_side_push: float = 0.30      # Start side-push if wall closer than this
+    wall_front_slow: float = 0.70     # Start slowing if wall ahead closer than this
+    wall_side_push: float = 0.25      # Start side-push if wall closer than this
 
 
 class Navigator:
@@ -144,6 +144,18 @@ class Navigator:
             return False
 
         start = world_to_cell(x, y, self.rows, self.cols, self.cfg.cell_size)
+
+        # If start cell is a wall (odom drift), find nearest free cell
+        sr, sc = start
+        if sr < 0 or sr >= self.rows or sc < 0 or sc >= self.cols or self.grid[sr][sc] != 0:
+            best_d = float('inf')
+            for r in range(self.rows):
+                for c in range(self.cols):
+                    if self.grid[r][c] == 0:
+                        d = abs(r - sr) + abs(c - sc)
+                        if d < best_d:
+                            best_d = d
+                            start = (r, c)
 
         # Try inflated grid first (safer paths)
         path = astar(self._inflated, start, self.goal_cell, eight_connected=True)
