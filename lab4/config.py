@@ -14,11 +14,11 @@ class SimConfig:
     friction: float = 0.05
 
     # Particle filter
-    n_particles: int = 500
-    scan_period: float = 0.4
-    n_lidar_rays: int = 36
-    pf_init_std_xy: float = 0.5
-    pf_init_std_th: float = 0.3
+    n_particles: int = 800
+    scan_period: float = 0.2
+    n_lidar_rays: int = 72
+    pf_init_std_xy: float = 0.3
+    pf_init_std_th: float = 0.2
 
     # Navigation
     nav_enabled: bool = False
@@ -37,9 +37,9 @@ class SimConfig:
     emergency_pf_runs: int = 3
 
     # Kidnapped-robot PF recovery
-    pf_random_inject_pct: float = 0.05    # fraction of particles replaced with random free-space samples each resample
-    pf_dense_scan_interval: int = 10      # every N scans, use a denser lidar sweep
-    pf_dense_scan_rays: int = 72          # number of rays for the dense sweep
+    pf_random_inject_pct: float = 0.01    # fraction of particles replaced with random free-space samples each resample
+    pf_dense_scan_interval: int = 5       # every N scans, use a denser lidar sweep
+    pf_dense_scan_rays: int = 120         # number of rays for the dense sweep
 
     # Autotest scenario
     autotest: bool = False

@@ -83,11 +83,11 @@ class RobotAgent:
         # ── Particle Filter ──
         pf_cfg = PFConfig(
             n=cfg.n_particles,
-            trans_noise_per_m=0.05,
-            rot_noise_per_rad=0.04,
+            trans_noise_per_m=0.04,
+            rot_noise_per_rad=0.03,
             trans_noise_min=0.001,
             rot_noise_min=0.001,
-            meas_std=0.5,
+            meas_std=0.40,             # balanced: discriminative but not particle-starved
         )
         self.pf = ParticleFilter(pf_cfg)
         self.pf.init_gaussian(sx, sy, sth, std_xy=cfg.pf_init_std_xy, std_th=cfg.pf_init_std_th)
@@ -332,10 +332,9 @@ class RobotAgent:
                 neff_val = self.pf.neff()
 
                 # Compute PF estimate BEFORE resample — weights are still
-                # informative (reflect measurement likelihood).  After resample
-                # all weights become 1/N and the estimate degenerates to an
-                # unweighted mean which can land *between* modes on symmetric maps.
-                x_pf, y_pf, th_pf = self.pf.estimate()
+                # informative (reflect measurement likelihood).  Use cluster-
+                # based estimate to avoid averaging between symmetric modes.
+                x_pf, y_pf, th_pf, cluster_wf = self.pf.estimate_best_cluster(radius=1.5)
 
                 self.pf.resample()
 
@@ -346,7 +345,7 @@ class RobotAgent:
                 self.last_scan = None
 
             if not did_resample:
-                x_pf, y_pf, th_pf = self.pf.estimate()
+                x_pf, y_pf, th_pf, cluster_wf = self.pf.estimate_best_cluster(radius=1.5)
             pf_err = math.hypot(x_pf - x_gt, y_pf - y_gt)
 
             # Log PF data (GT logged for metrics/debug only)
@@ -364,17 +363,15 @@ class RobotAgent:
                 )
 
             # ── Control pose: odometry corrected by PF when confident ──
-            # Gate: Neff > 30% of N AND a fresh resample just happened.
-            # Use moderate alpha so PF can steer odom on symmetric maps.
-            pf_confidence_thresh = self.cfg.n_particles * 0.30
-            if neff_val > pf_confidence_thresh and did_resample:
-                alpha = 0.25
+            # Gate on cluster weight fraction (not global Neff, which is
+            # useless on symmetric maps where particles spread across modes).
+            # Adaptive alpha: higher cluster_wf → stronger correction.
+            if did_resample and cluster_wf > 0.05:
+                alpha = min(0.30, cluster_wf * 0.5)  # e.g. cwf=0.3 → α=0.15
                 dx = x_pf - x_odom
                 dy = y_pf - y_odom
-                dth = _wrap(th_pf - th_odom)
                 self.odom.x += alpha * dx
                 self.odom.y += alpha * dy
-                self.odom.theta = _wrap(self.odom.theta + alpha * dth)
                 x_odom, y_odom, th_odom = self.odom.x, self.odom.y, self.odom.theta
 
             x_ctrl, y_ctrl, th_ctrl = x_odom, y_odom, th_odom

@@ -59,10 +59,10 @@ def _print_summary(label: str, d: dict[str, np.ndarray]) -> None:
     print("=" * 60)
 
 
-def _run_one(map_name: str, n_particles: int = 500, n_rays: int = 36,
-             max_s: float = 40.0, seed: int = 42, n_humans: int = 2,
-             inject_pct: float = 0.02, dense_interval: int = 5,
-             dense_rays: int = 72) -> dict[str, np.ndarray]:
+def _run_one(map_name: str, n_particles: int = 800, n_rays: int = 72,
+             max_s: float = 60.0, seed: int = 42, n_humans: int = 2,
+             inject_pct: float = 0.01, dense_interval: int = 5,
+             dense_rays: int = 120) -> dict[str, np.ndarray]:
     map_path = pick_map("shared/maps", direct=map_name)
 
     cfg = SimConfig(
@@ -70,7 +70,7 @@ def _run_one(map_name: str, n_particles: int = 500, n_rays: int = 36,
         cell_size=0.5,
         hz=50.0,
         n_particles=n_particles,
-        scan_period=0.3,
+        scan_period=0.2,
         n_lidar_rays=n_rays,
         nav_enabled=True,
         goal_mode="random",
@@ -109,13 +109,13 @@ def _run_one(map_name: str, n_particles: int = 500, n_rays: int = 36,
 # ── Main ─────────────────────────────────────────────────────────────────────
 def run_proof():
     # 1) Maze — distinct corridors → PF converges well
-    d_maze = _run_one("maze_lab4", n_particles=500, n_rays=36,
-                      max_s=40.0, n_humans=0, seed=42)
+    d_maze = _run_one("maze_lab4", n_particles=800, n_rays=72,
+                      max_s=60.0, n_humans=0, seed=42)
     _print_summary("maze_lab4", d_maze)
 
     # 2) Warehouse — highly symmetric shelves → PF struggles (expected)
-    d_wh = _run_one("warehouse_small", n_particles=500, n_rays=36,
-                    max_s=40.0, n_humans=2, seed=42)
+    d_wh = _run_one("warehouse_small", n_particles=800, n_rays=72,
+                    max_s=60.0, n_humans=2, seed=42)
     _print_summary("warehouse_small", d_wh)
 
     # ── Plot ─────────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ def run_proof():
         axes[2, col].grid(True, alpha=0.3)
 
     fig.suptitle("PF-Corrected Odometry — No Ground-Truth in Control Loop\n"
-                 "(500 particles, 2% random inject, dense scan every 5 steps)",
+                 "(800 particles, 72 rays, cluster estimate, position-only fusion)",
                  fontsize=11)
     fig.tight_layout()
 

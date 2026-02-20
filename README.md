@@ -164,16 +164,16 @@ PF debug overlay (red cross = PF estimate, green dots = particles) visible in GU
 ```bash
 python -m lab4.main --map maze_lab4 --nav --goal_random --direct --seed 42 --max_sim_s 40
 ```
-The maze has unique corridor geometry — PF converges to ~2–4m error with high Neff (~60%).
+The maze has unique corridor geometry — PF converges to ~5m mean error with Neff ~180.
 Good test case for demonstrating proper MCL localization without perceptual aliasing.
 
 ### Scenario 5 — Kidnapped-Robot Recovery Demo
 ```bash
 python -m lab4.main --map warehouse_small --nav --goal_random --direct --seed 99 --max_sim_s 60
 ```
-Random particle injection (2% per scan) + dense lidar sweeps (72 rays every 5 scans)
+Random particle injection (1% per scan) + dense lidar sweeps (120 rays every 5 scans)
 continuously attempt re-localization. On symmetric maps, the PF may not fully converge
-but the robot still navigates successfully via odometry.
+but the robot still navigates successfully via odometry + cluster-based PF fusion.
 
 ### Scenario 6 — Bubbleperson Workers Patrol
 ```bash
@@ -191,6 +191,13 @@ python proof_pf_no_gt.py
 Runs two headless simulations (maze_lab4 + warehouse_small) and generates `pf_proof.png`:
 3×2 panel plot showing position error, heading error, and Neff vs time for each map.
 Demonstrates that the control loop uses 0% ground-truth.
+
+**Latest benchmark results** (800 particles, 72 rays, cluster estimate, position-only fusion):
+
+| Map | Distance | Mean PF err | Final PF err | Final Odom err | Mean Neff |
+|-----|----------|-------------|--------------|----------------|-----------|
+| maze_lab4 | 5.0 m | 5.21 m | 8.70 m | 0.75 m | 180.2 |
+| warehouse_small | 155.1 m | 9.24 m | 4.57 m | 4.91 m | 8.9 |
 
 ---
 
@@ -253,10 +260,11 @@ shared/
 Wheel Encoders → DiffDrive Odometry (local pose)
     → PF Predict (motion model + noise)
     → Physical Lidar Scan (ray-marching on grid from robot body)
-    → Random Particle Injection (kidnapped-robot recovery, 2%)
-    → PF Update (Gaussian likelihood) → Neff check → Systematic Resample
-    → PF Estimate (weighted mean)
-    → Odometry + PF Fusion (blend when Neff > 30%, α=0.25)
+    → Random Particle Injection (kidnapped-robot recovery, 1%)
+    → PF Update (Gaussian likelihood) → Systematic Resample
+    → PF Cluster Estimate (best-mode weighted mean, avoids symmetric aliasing)
+    → Odometry + PF Fusion (position-only, gated on cluster weight fraction,
+      adaptive α = min(0.30, cwf×0.5))
     → Control Pose (odom-corrected-by-PF)
     → A* Plan (inflated grid, fallback to raw grid)
     → Pure-Pursuit Follower + Reactive Wall Avoidance
